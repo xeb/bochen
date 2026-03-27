@@ -42,7 +42,7 @@ class WorldModelAgent:
 
     def run_episode(self, game_id: str) -> dict:
         """Run one episode using world model for action selection."""
-        env = ArcEnv(game_id, offline=True, render=False)
+        env = ArcEnv(game_id, offline=False, render=False)
         grid, state, score, obs = env.reset()
         h, w = grid.shape
 

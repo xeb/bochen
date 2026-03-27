@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-# /// script
-# dependencies = ["arc-agi", "numpy", "torch", "openai"]
-# ///
 """
 Bochen Research Harness — continuous round-robin orchestrator for ARC-AGI-3 experiments.
 

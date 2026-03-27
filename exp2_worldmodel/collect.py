@@ -13,10 +13,11 @@ from shared.env_wrapper import ArcEnv, SIMPLE_ACTIONS, ALL_ACTIONS
 from shared.perception import one_hot_grid
 
 
-def collect_transitions(game_id: str, num_steps: int = 50000,
+def collect_transitions(game_id: str, num_steps: int = 10000,
                         save_dir: str = None) -> str:
     """Run random agent, collect (grid, action, next_grid) transitions.
     Returns path to saved .npz file.
+    Respects 600 RPM rate limit for online mode.
     """
     save_dir = save_dir or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "data"
@@ -24,7 +25,7 @@ def collect_transitions(game_id: str, num_steps: int = 50000,
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, f"{game_id}_transitions.npz")
 
-    env = ArcEnv(game_id, offline=True, render=False)
+    env = ArcEnv(game_id, offline=False, render=False)
     grid, state, score, obs = env.reset()
     h, w = grid.shape
 
@@ -33,10 +34,16 @@ def collect_transitions(game_id: str, num_steps: int = 50000,
     grids_after = []
     collected = 0
 
+    import time
+    min_interval = 60.0 / 500  # stay under 600 RPM with margin
+
     while collected < num_steps:
-        # Random action
-        action = random.choice(ALL_ACTIONS)
-        action_idx = ALL_ACTIONS.index(action)
+        t0 = time.monotonic()
+
+        # Random action from available actions
+        available = env.available_actions
+        action = random.choice(available) if available else random.choice(ALL_ACTIONS)
+        action_idx = ALL_ACTIONS.index(action) if action in ALL_ACTIONS else 0
         data = None
         if action == GameAction.ACTION6:
             data = {"x": random.randint(0, w - 1), "y": random.randint(0, h - 1)}
@@ -52,8 +59,13 @@ def collect_transitions(game_id: str, num_steps: int = 50000,
         if state in ("WIN", "GAME_OVER"):
             grid, state, score, obs = env.reset()
 
-        if collected % 10000 == 0:
+        if collected % 1000 == 0:
             print(f"  [exp2 collect] {game_id}: {collected}/{num_steps} transitions")
+
+        # Rate limit
+        elapsed = time.monotonic() - t0
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
 
     np.savez_compressed(
         save_path,

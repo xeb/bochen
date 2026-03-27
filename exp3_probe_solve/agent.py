@@ -28,7 +28,7 @@ class ProbeSolveAgent:
 
     def run_episode(self, game_id: str) -> dict:
         """Run one full probe-then-solve episode."""
-        env = ArcEnv(game_id, offline=True, render=False)
+        env = ArcEnv(game_id, offline=False, render=False)
 
         # Phase 1: Probe
         probe_log = run_probe_battery(env, self.memory, game_id)

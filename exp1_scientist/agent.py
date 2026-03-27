@@ -58,7 +58,7 @@ class ScientistAgent:
 
     def run_episode(self, game_id: str) -> dict:
         """Run a single episode. Returns result dict."""
-        env = ArcEnv(game_id, offline=True, render=False)
+        env = ArcEnv(game_id, offline=False, render=False)
         grid, state, score, obs = env.reset()
         belief = BeliefState()
         prev_grid = None

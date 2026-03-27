@@ -1,18 +1,48 @@
-# ARC-AGI-3
+# Bochen (בֹּחֵן) — ARC-AGI-3 Research Harness
 
 An Interactive Reasoning Benchmark designed to measure an AI Agent's ability to generalize in novel, unseen environments.
 
 Measures five critical capabilities: Exploration, Percept-Plan-Action cycles, Memory, Goal Acquisition, and Alignment.
 
-## Installation
+## Project Setup
+
+```bash
+# Venv uses Python 3.12 with torch 2.6.0+cu124 for RTX 4090
+# Venv already created — just activate:
+source .venv/bin/activate
+
+# Or run directly:
+.venv/bin/python harness.py
+```
+
+### Recreating the venv from scratch
+```bash
+uv venv --python 3.12
+uv pip install torch --index-url https://download.pytorch.org/whl/cu124
+uv pip install arc-agi openai numpy
+```
+
+## ARC-AGI-3 API Notes
+
+- `obs.frame` is a list -> `np.array(obs.frame)` gives shape `(1, 64, 64)` int8
+- `obs.state` is a `GameState` enum: `GameState.NOT_FINISHED`, `GameState.WIN`, `GameState.GAME_OVER`
+- `obs.available_actions` is a list of ints (e.g., `[1, 2, 3, 4]`) — not all 7 actions are always available
+- `env.step(action, data=None, reasoning=None)` returns `FrameDataRaw`
+- OFFLINE mode requires local game files (not included); use ONLINE mode
+- Anonymous access gives 25 games; 600 RPM rate limit
+
+## Running the Harness
+
+```bash
+.venv/bin/python harness.py                              # all experiments, all games
+.venv/bin/python harness.py --games ls20                 # single game
+.venv/bin/python harness.py --experiments exp3_probe_solve  # single experiment
+```
+
+## Original ARC-AGI SDK Installation
 
 ```bash
 uv add --script='main.py' 'arc-agi'
-```
-
-Or for project-level:
-```bash
-uv add arc-agi
 ```
 
 Optionally set API key (required for non-default games):
