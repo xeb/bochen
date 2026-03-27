@@ -33,7 +33,7 @@ from shared.metrics import format_result_line, format_summary_table, result_to_j
 DEFAULT_GAMES = ["ls20", "ft09", "vc33"]
 
 EXPERIMENT_TIMEOUTS = {
-    "exp1_scientist": 300,      # 5 min (LLM inference is slow)
+    "exp1_scientist": 600,      # 10 min (LLM inference is slow)
     "exp2_worldmodel": 120,     # 2 min
     "exp3_probe_solve": 60,     # 1 min
 }
@@ -185,8 +185,8 @@ def maybe_train_world_model(db: BochenDB, games: list[str]):
         print("\n[exp2] Collecting transition data for world model training...")
         from exp2_worldmodel.collect import collect_transitions
         for game_id in games:
-            # Collect fewer transitions for faster bootstrap
-            collect_transitions(game_id, num_steps=10000,
+            # Small bootstrap set — fast start, retrain later with more data
+            collect_transitions(game_id, num_steps=2000,
                               save_dir=str(data_dir))
         data_files = list(data_dir.glob("*_transitions.npz"))
 

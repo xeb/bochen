@@ -35,7 +35,7 @@ def collect_transitions(game_id: str, num_steps: int = 10000,
     collected = 0
 
     import time
-    min_interval = 60.0 / 500  # stay under 600 RPM with margin
+    min_interval = 60.0 / 300  # stay well under 600 RPM (300 RPM target)
 
     while collected < num_steps:
         t0 = time.monotonic()

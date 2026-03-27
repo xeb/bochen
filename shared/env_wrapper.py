@@ -1,9 +1,23 @@
 """Wrapper around arc_agi environments for consistent interface."""
 
+import time
 import numpy as np
 from arc_agi import Arcade, OperationMode
 from arcengine import GameAction
 from arcengine.enums import GameState
+
+# Global rate limiter: 300 RPM target (well under 600 RPM limit)
+_MIN_INTERVAL = 60.0 / 300
+_last_api_call = 0.0
+
+
+def _rate_limit():
+    global _last_api_call
+    now = time.monotonic()
+    elapsed = now - _last_api_call
+    if elapsed < _MIN_INTERVAL:
+        time.sleep(_MIN_INTERVAL - elapsed)
+    _last_api_call = time.monotonic()
 
 
 # Map string names to GameAction enums
@@ -104,17 +118,29 @@ class ArcEnv:
 
     def reset(self):
         """Reset environment. Returns (grid, state, score, raw_obs)."""
+        _rate_limit()
         self._last_obs = self.env.reset()
         return self._extract()
 
     def step(self, action: GameAction, data: dict = None):
         """Take an action. Returns (grid, state, score, raw_obs)."""
-        self._last_obs = self.env.step(action, data=data)
+        _rate_limit()
+        try:
+            result = self.env.step(action, data=data)
+            if result is not None:
+                self._last_obs = result
+        except Exception as e:
+            print(f"  [env] step error: {e}")
+            # Return last known state
         return self._extract()
 
     def _extract(self):
         """Extract (grid, state, score, raw_obs) from observation."""
         obs = self._last_obs
+        if obs is None:
+            # Return safe defaults
+            import numpy as np
+            return np.zeros((64, 64), dtype=np.int8), "GAME_OVER", 0, None
         grid = extract_grid(obs)
         state = extract_state(obs)
         score = getattr(obs, 'levels_completed', 0) or 0

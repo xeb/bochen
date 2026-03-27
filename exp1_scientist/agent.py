@@ -69,16 +69,27 @@ class ScientistAgent:
             structured_obs = serialize_grid(grid, prev_grid)
             ascii_grid = grid_to_ascii(grid)
 
-            user_msg = (
-                f"## Step {step} | Actions used: {total_actions}\n\n"
-                f"### Grid ({structured_obs['grid_size']})\n```\n{ascii_grid}\n```\n\n"
-                f"### Structured observation\n```json\n"
-                f"{json.dumps({k: v for k, v in structured_obs.items() if k != 'objects'}, indent=2)}\n```\n\n"
-                f"### Objects: {structured_obs['num_objects']} found\n"
-            )
-            for obj in structured_obs["objects"][:10]:
-                user_msg += f"  - color={obj['color']} size={obj['size']} center={obj['center']} bbox={obj['bbox']}\n"
+            # Compact prompt — skip full ASCII grid, use structured data only
+            compact_obs = {
+                "grid_size": structured_obs["grid_size"],
+                "background": structured_obs.get("background_color"),
+                "colors": structured_obs["color_counts"],
+                "num_objects": structured_obs["num_objects"],
+                "delta": structured_obs.get("delta"),
+            }
+            objects_str = ""
+            for obj in structured_obs["objects"][:8]:
+                objects_str += f"  color={obj['color']} size={obj['size']} center={obj['center']}\n"
 
+            user_msg = (
+                f"Step {step}/{MAX_TOTAL_STEPS} | Actions used: {total_actions}\n"
+                f"State: {json.dumps(compact_obs)}\n"
+                f"Objects:\n{objects_str}"
+            )
+
+            # Tell the LLM which actions are available
+            avail_names = [str(a).split(".")[-1] for a in env.available_actions]
+            user_msg += f"\n### Available actions: {', '.join(avail_names)}\n"
             user_msg += f"\n{belief.to_prompt_text()}\n\nWhat action should I take?"
 
             # Query LLM
@@ -86,15 +97,21 @@ class ScientistAgent:
             self.json_parse_attempts += 1
 
             if decision is None:
-                # Fallback: cycle through actions
-                fallback_action = f"ACTION{(step % 5) + 1}"
+                # Fallback: cycle through available actions
+                avail = env.available_actions
+                fallback_action = str(avail[step % len(avail)]).split(".")[-1]
                 decision = {"action": fallback_action, "reasoning": "JSON parse fallback"}
             else:
                 self.json_parse_successes += 1
 
-            # Execute action
+            # Execute action — constrain to available actions
             action_name = decision.get("action", "ACTION1")
             action = parse_action(action_name)
+
+            # If LLM picked an unavailable action, substitute a valid one
+            if action not in env.available_actions:
+                action = env.available_actions[step % len(env.available_actions)]
+
             data = None
             if action == GameAction.ACTION6 and decision.get("x") is not None:
                 data = {"x": int(decision["x"]), "y": int(decision["y"])}

@@ -192,6 +192,14 @@ Game class must extend `ARCBaseGame` and implement: `__init__`, `on_set_level(le
 - Exceeding returns 429 with exponential backoff
 - Contact team@arcprize.org with subject "Increase Rate Limits" for higher throughput
 
+## Codex Delegation
+
+When I say "ask codex to..." or "have codex...", run:
+
+```bash
+codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 "the prompt"
+```
+
 ## Useful Links
 
 - Games browser: arcprize.org/tasks
