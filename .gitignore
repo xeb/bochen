@@ -1,0 +1,26 @@
+# Database
+arc_agi_3.db
+
+# Results (generated, not committed)
+*/results/*.jsonl
+
+# Checkpoints (large binary files)
+*/checkpoints/*.pt
+*/checkpoints/*.pkl
+
+# Collected data
+exp2_worldmodel/data/*.npz
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Logs
+*.log
+harness.log
+
+# IDE
+.idea/
+.vscode/
