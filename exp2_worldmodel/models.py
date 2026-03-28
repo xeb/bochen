@@ -1,82 +1,74 @@
-"""Neural network models for the world model experiment."""
+"""JAX/Flax neural network models for the world model experiment.
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+Replaces exp2_worldmodel/models.py. Omits ObjectSegmenter (unused at runtime,
+BatchNorm makes the Flax port disproportionately complex).
+"""
 
-
-class ObjectSegmenter(nn.Module):
-    """CNN that predicts per-cell object membership from one-hot grid."""
-
-    def __init__(self, num_colors=16, channels=None):
-        super().__init__()
-        channels = channels or [16, 32, 64]
-        layers = []
-        in_c = num_colors
-        for out_c in channels:
-            layers.extend([
-                nn.Conv2d(in_c, out_c, 3, padding=1),
-                nn.BatchNorm2d(out_c),
-                nn.ReLU(),
-            ])
-            in_c = out_c
-        # Output: per-cell embedding for clustering into objects
-        layers.append(nn.Conv2d(in_c, 32, 1))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x):
-        """Input: (B, 16, H, W), Output: (B, 32, H, W) per-cell embeddings."""
-        return self.net(x)
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
 
 
-class TransitionPredictor(nn.Module):
-    """Predict object-level transitions given state features and action."""
+def _adaptive_avg_pool(x, output_size):
+    """Replicate PyTorch's AdaptiveAvgPool2d for channel-last (B, H, W, C) input.
 
-    def __init__(self, state_dim=128, action_dim=8, hidden=256, num_layers=3):
-        super().__init__()
-        self.action_embed = nn.Embedding(action_dim, 32)
-        layers = []
-        in_dim = state_dim + 32
-        for _ in range(num_layers):
-            layers.extend([nn.Linear(in_dim, hidden), nn.ReLU()])
-            in_dim = hidden
-        self.backbone = nn.Sequential(*layers)
-
-        # Heads
-        self.delta_head = nn.Linear(hidden, 2)       # dx, dy movement
-        self.color_head = nn.Linear(hidden, 16)       # new color (softmax)
-        self.delete_head = nn.Linear(hidden, 1)       # P(deleted)
-        self.state_head = nn.Linear(hidden, 128)      # predicted next state embedding
-
-    def forward(self, state_features, action_idx):
-        """
-        state_features: (B, state_dim)
-        action_idx: (B,) long tensor
-        """
-        act_emb = self.action_embed(action_idx)
-        x = torch.cat([state_features, act_emb], dim=-1)
-        h = self.backbone(x)
-        return {
-            "delta_xy": self.delta_head(h),
-            "new_color": self.color_head(h),
-            "delete_prob": torch.sigmoid(self.delete_head(h)),
-            "next_state": self.state_head(h),
-        }
+    Only works when H and W are evenly divisible by the target size.
+    Our grids are always 64x64, pooling to 16 or 4 — both divide evenly.
+    """
+    B, H, W, C = x.shape
+    oh, ow = output_size
+    wh, ww = H // oh, W // ow
+    x = x.reshape(B, oh, wh, ow, ww, C)
+    return x.mean(axis=(2, 4))
 
 
 class GridEncoder(nn.Module):
-    """Encode full grid into a fixed-size state vector."""
+    """Encode full grid into a fixed-size state vector.
 
-    def __init__(self, num_colors=16, out_dim=128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(num_colors, 32, 3, padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d(16),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d(4),
-            nn.Flatten(),
-            nn.Linear(64 * 4 * 4, out_dim),
-        )
+    Input:  (B, 16, 64, 64) one-hot grid in NCHW format (matching existing API)
+    Output: (B, out_dim) state embedding
+    """
+    num_colors: int = 16
+    out_dim: int = 128
 
-    def forward(self, x):
-        return self.net(x)
+    @nn.compact
+    def __call__(self, x):
+        # Transpose NCHW -> NHWC for Flax convolutions
+        x = jnp.transpose(x, (0, 2, 3, 1))
+        x = nn.Conv(features=32, kernel_size=(3, 3), padding='SAME')(x)
+        x = nn.relu(x)
+        x = _adaptive_avg_pool(x, (16, 16))
+        x = nn.Conv(features=64, kernel_size=(3, 3), padding='SAME')(x)
+        x = nn.relu(x)
+        x = _adaptive_avg_pool(x, (4, 4))
+        x = x.reshape((x.shape[0], -1))
+        x = nn.Dense(features=self.out_dim)(x)
+        return x
+
+
+class TransitionPredictor(nn.Module):
+    """Predict object-level transitions given state features and action.
+
+    Input:  state_features (B, state_dim), action_idx (B,) int
+    Output: dict with delta_xy, new_color, delete_prob, next_state
+    """
+    state_dim: int = 128
+    action_dim: int = 8
+    hidden: int = 256
+    num_layers: int = 3
+
+    @nn.compact
+    def __call__(self, state_features, action_idx):
+        act_emb = nn.Embed(num_embeddings=self.action_dim, features=32)(action_idx)
+        x = jnp.concatenate([state_features, act_emb], axis=-1)
+
+        for _ in range(self.num_layers):
+            x = nn.Dense(features=self.hidden)(x)
+            x = nn.relu(x)
+
+        return {
+            "delta_xy": nn.Dense(features=2, name="delta_head")(x),
+            "new_color": nn.Dense(features=16, name="color_head")(x),
+            "delete_prob": jax.nn.sigmoid(nn.Dense(features=1, name="delete_head")(x)),
+            "next_state": nn.Dense(features=128, name="state_head")(x),
+        }

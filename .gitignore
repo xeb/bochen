@@ -16,6 +16,7 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+.venv2/
 
 # Logs
 *.log
@@ -24,3 +25,4 @@ harness.log
 # IDE
 .idea/
 .vscode/
+.fuse_hidden*

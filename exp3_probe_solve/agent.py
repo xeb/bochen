@@ -1,10 +1,12 @@
-"""Experiment 3: Two-Phase Probe-Solve Agent with Causal Memory."""
+"""JAX Experiment 3: Two-Phase Probe-Solve Agent with Causal Memory."""
 
 import sys
 import os
-import torch
+import jax
+import jax.numpy as jnp
+import orbax.checkpoint as ocp
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from shared.env_wrapper import ArcEnv
 from exp3_probe_solve.encoder import StateEncoder
@@ -15,16 +17,23 @@ from exp3_probe_solve.config import MEMORY_EMBED_DIM
 
 
 class ProbeSolveAgent:
-    """Two-phase agent: systematic probing then memory-guided solving."""
+    """Two-phase agent: systematic probing then memory-guided solving (JAX)."""
 
-    def __init__(self, device: str = "cuda", memory_path: str = None):
-        self.device = device
-        self.encoder = StateEncoder(embed_dim=MEMORY_EMBED_DIM).to(device)
-        self.memory = CausalMemory(self.encoder, device)
+    def __init__(self, memory_path: str = None):
+        self.se = StateEncoder(embed_dim=MEMORY_EMBED_DIM)
+        rng = jax.random.key(42)
+        dummy = jnp.zeros((1, 16, 64, 64))
+        self.encoder_params = self.se.init(rng, dummy)
+
+        self.memory = CausalMemory(
+            encoder_params=self.encoder_params,
+            max_entries=10000,
+            embed_dim=MEMORY_EMBED_DIM,
+        )
 
         if memory_path and os.path.exists(memory_path):
             self.memory.load(memory_path)
-            print(f"  [exp3] Loaded memory with {self.memory.size} entries")
+            print(f"  [exp3/jax] Loaded memory with {self.memory.size} entries")
 
     def run_episode(self, game_id: str) -> dict:
         """Run one full probe-then-solve episode."""
@@ -36,7 +45,6 @@ class ProbeSolveAgent:
                             if "REPEAT" not in e.get("action", "")
                             and "UNDO" not in e.get("action", "")])
 
-        # Analyze probe results
         effective = sum(1 for e in probe_log
                        if e.get("effect", {}).get("cells_changed", 0) > 0)
 
@@ -62,6 +70,6 @@ class ProbeSolveAgent:
         self.memory.save(path)
 
     def save_encoder(self, path: str):
-        """Save encoder weights."""
+        """Save encoder params via Orbax."""
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(self.encoder.state_dict(), path)
+        ocp.StandardCheckpointer().save(path, self.encoder_params, force=True)

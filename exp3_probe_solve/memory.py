@@ -1,46 +1,59 @@
-"""Causal memory: stores (state, action, effect) triples with GPU-accelerated retrieval."""
+"""Causal memory with numpy storage and JAX-accelerated retrieval.
 
-import torch
+Replaces exp3_probe_solve/memory.py. Key differences:
+- Embeddings stored as numpy (mutable, no copy-on-write overhead)
+- JAX used only for the retrieval matmul (where it actually helps)
+- Persistence stays as pickle (mixed Python dicts + numpy, not a pure pytree)
+"""
+
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pickle
-from exp3_probe_solve.encoder import StateEncoder
+
+from exp3_probe_solve.encoder import encode_grid
 
 
 class CausalMemory:
-    """GPU-accelerated causal memory for cross-game transfer."""
+    """Causal memory for cross-game transfer with JAX-accelerated retrieval."""
 
-    def __init__(self, encoder: StateEncoder, device: str = "cuda"):
-        self.encoder = encoder
-        self.device = device
-        self.entries = []          # list of dicts
-        self.embeddings = None     # (N, embed_dim) tensor on GPU
+    def __init__(self, encoder_params: dict, max_entries: int = 10000,
+                 embed_dim: int = 128):
+        self.encoder_params = encoder_params
+        self.embed_dim = embed_dim
+        self.max_entries = max_entries
+        self.entries = []
+        self.embeddings = np.zeros((max_entries, embed_dim), dtype=np.float32)
+        self.count = 0
 
     def store(self, grid: np.ndarray, action: str, effect: dict, game_id: str):
         """Store an observation triple."""
-        emb = self.encoder.encode_grid(grid)
+        emb = encode_grid(self.encoder_params, grid)
         self.entries.append({
             "action": action,
             "effect": effect,
             "game_id": game_id,
             "confirmed_count": 1,
         })
-        if self.embeddings is None:
-            self.embeddings = emb.unsqueeze(0)
-        else:
-            self.embeddings = torch.cat([self.embeddings, emb.unsqueeze(0)])
+        self.embeddings[self.count] = emb
+        self.count += 1
 
     def retrieve(self, grid: np.ndarray, k: int = 10) -> list[tuple[dict, float]]:
         """Find K most similar memories by state embedding cosine similarity."""
-        if self.embeddings is None or len(self.entries) == 0:
+        if self.count == 0:
             return []
-        query = self.encoder.encode_grid(grid).unsqueeze(0)
-        sims = torch.mm(query, self.embeddings.T).squeeze(0)
-        actual_k = min(k, len(self.entries))
-        topk = torch.topk(sims, actual_k)
-        return [
-            (self.entries[i], sims[i].item())
-            for i in topk.indices.tolist()
-        ]
+        query = encode_grid(self.encoder_params, grid)  # (embed_dim,)
+        actual_k = min(k, self.count)
+
+        # Move to JAX only for the matmul
+        q = jnp.array(query)
+        emb = jnp.array(self.embeddings[:self.count])
+        sims = jnp.dot(emb, q)  # (count,)
+        top_vals, top_idx = jax.lax.top_k(sims, actual_k)
+
+        indices = top_idx.tolist()
+        values = top_vals.tolist()
+        return [(self.entries[i], values[j]) for j, i in enumerate(indices)]
 
     def retrieve_for_action(self, grid: np.ndarray, action: str,
                             k: int = 5) -> list[tuple[dict, float]]:
@@ -59,10 +72,12 @@ class CausalMemory:
         return effects_by_action
 
     def save(self, path: str):
-        """Serialize memory to disk."""
+        """Serialize memory to disk. Uses pickle (not Orbax) because entries
+        contain arbitrary Python dicts with strings and nested structures."""
         data = {
             "entries": self.entries,
-            "embeddings": self.embeddings.cpu().numpy() if self.embeddings is not None else None,
+            "embeddings": self.embeddings[:self.count],
+            "count": self.count,
         }
         with open(path, "wb") as f:
             pickle.dump(data, f)
@@ -72,9 +87,9 @@ class CausalMemory:
         with open(path, "rb") as f:
             data = pickle.load(f)
         self.entries = data["entries"]
-        if data["embeddings"] is not None:
-            self.embeddings = torch.from_numpy(data["embeddings"]).to(self.device)
+        self.count = data["count"]
+        self.embeddings[:self.count] = data["embeddings"]
 
     @property
     def size(self) -> int:
-        return len(self.entries)
+        return self.count

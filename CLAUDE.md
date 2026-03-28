@@ -6,20 +6,20 @@ Measures five critical capabilities: Exploration, Percept-Plan-Action cycles, Me
 
 ## Project Setup
 
-```bash
-# Venv uses Python 3.12 with torch 2.6.0+cu124 for RTX 4090
-# Venv already created — just activate:
-source .venv/bin/activate
+All models use **JAX** (not PyTorch). The RTX 4090 runs JAX via CUDA.
 
-# Or run directly:
-.venv/bin/python harness.py
+```bash
+# Use run.sh — it sets LD_LIBRARY_PATH for CUDA and activates the venv:
+./run.sh harness.py
+./run.sh imagine_agent.py ls20
 ```
 
 ### Recreating the venv from scratch
 ```bash
-uv venv --python 3.12
-uv pip install torch --index-url https://download.pytorch.org/whl/cu124
-uv pip install arc-agi openai numpy
+uv venv .venv2 --python 3.12
+uv pip install --python .venv2 "jax[cuda12]" flax optax orbax-checkpoint
+uv pip install --python .venv2 arc-agi numpy
+uv pip install --python .venv2 nvidia-cusparse-cu12 nvidia-cublas-cu12 nvidia-cuda-runtime-cu12 nvidia-cusolver-cu12 nvidia-cufft-cu12 nvidia-cudnn-cu12 nvidia-nccl-cu12 nvidia-nvjitlink-cu12
 ```
 
 ## ARC-AGI-3 API Notes
@@ -34,10 +34,19 @@ uv pip install arc-agi openai numpy
 ## Running the Harness
 
 ```bash
-.venv/bin/python harness.py                              # all experiments, all games
-.venv/bin/python harness.py --games ls20                 # single game
-.venv/bin/python harness.py --experiments exp3_probe_solve  # single experiment
+./run.sh harness.py                                        # all experiments, all games
+./run.sh harness.py --games ls20                           # single game
+./run.sh harness.py --experiments imagine                  # just the Imagine agent
+./run.sh imagine_agent.py ls20                             # run Imagine agent standalone
 ```
+
+## Experiments (all JAX)
+
+| Experiment | Description | GPU usage |
+|-----------|-------------|-----------|
+| `imagine` | Probe -> train world model -> BFS in imagination -> execute | Heavy (model training + search) |
+| `exp2_worldmodel` | Object-centric world model + info-gain search | Medium (inference) |
+| `exp3_probe_solve` | Systematic probes + causal memory retrieval | Light (embeddings) |
 
 ## Original ARC-AGI SDK Installation
 
