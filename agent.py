@@ -583,7 +583,62 @@ def astar_solve(world_model, world_params, role_model, role_params,
 
     elapsed = time.time() - t0
     print(f"  [solve] A* exhausted: {states_explored} in {elapsed:.1f}s, best_h={best_h:.0f}")
+
+    # Return the best sequence found even if h != 0
+    # The iterative loop will execute it, detect divergence, and retry
+    if best_h < start_h_val * 0.5:  # at least halved the heuristic
+        # Reconstruct best sequence by re-searching with smaller budget
+        # For now, do a greedy walk toward the best-h state
+        print(f"  [solve] Returning greedy best path (h went {start_h_val:.0f} -> {best_h:.0f})")
+        return _greedy_best_path(world_model, world_params, start_grid,
+                                 available_actions, movable_colors, target_arr,
+                                 max_depth=max_depth)
     return None
+
+
+def _greedy_best_path(world_model, world_params, start_grid,
+                      available_actions, movable_colors, target_arr,
+                      max_depth=80):
+    """Greedy walk: at each step pick the action that minimizes h."""
+    actions_arr = jnp.array(available_actions, dtype=jnp.int32)
+    num_actions = len(available_actions)
+
+    @jax.jit
+    def predict_all(grid_oh):
+        grids = jnp.repeat(grid_oh, num_actions, axis=0)
+        logits = world_model.apply(world_params, grids, actions_arr)
+        return jnp.argmax(logits, axis=1)
+
+    grid = start_grid
+    path = []
+    visited = {grid_hash(grid)}
+
+    for step in range(max_depth):
+        grid_oh = grid_to_onehot(grid)
+        next_grids = np.array(predict_all(grid_oh))
+
+        best_h = float('inf')
+        best_idx = 0
+        best_grid = None
+        for i in range(num_actions):
+            h = manhattan_heuristic(next_grids[i], movable_colors, target_arr)
+            if h < best_h:
+                best_h = h
+                best_idx = i
+                best_grid = next_grids[i]
+
+        if best_grid is not None and grid_hash(best_grid) not in visited:
+            visited.add(grid_hash(best_grid))
+            path.append(available_actions[best_idx])
+            grid = best_grid
+        else:
+            # All successors visited, try a random one
+            import random
+            i = random.randrange(num_actions)
+            path.append(available_actions[i])
+            grid = next_grids[i]
+
+    return path
 
 
 def escalate_to_llm(exploration: dict, perception_result: dict) -> list[int] | None:
@@ -706,67 +761,138 @@ class ThreePhaseAgent:
         print(f"  [perceive] Done in {perceive_time:.1f}s: "
               f"{perception['n_movable']} movable, {perception['n_targets']} targets")
 
-        # ── Phase 3: SOLVE ──
-        print(f"\n  === Phase 3: SOLVE ({game_id}) ===")
-        t3 = time.time()
-
-        solution = astar_solve(
-            self.world_model, self.world_params,
-            self.role_model, self.role_params,
-            exploration["initial_grid"], exploration["move_counts"],
-            available, movable_colors,
-            max_states=500000, max_depth=80,
-        )
-
-        if solution is None:
-            print("  [solve] A* failed — escalating to LLM...")
-            solution = escalate_to_llm(exploration, perception)
-
-        solve_time = time.time() - t3
-
-        if solution is None:
-            total_time = time.time() - t0
-            return {"won": False, "actions": len(transitions),
-                    "game_id": game_id, "phase": "solve_failed",
-                    "explore_time": explore_time, "perceive_time": perceive_time,
-                    "solve_time": solve_time, "total_time": total_time,
-                    "n_movable": perception["n_movable"],
-                    "n_targets": perception["n_targets"]}
-
-        # ── EXECUTE ──
-        print(f"\n  === EXECUTE: {len(solution)} actions on {game_id} ===")
-        env = ArcEnv(game_id, offline=False)
-        grid, state, score, obs = env.reset()
+        # ── Phase 3: ITERATIVE SOLVE ──
+        # Execute A* plan, detect divergence, re-explore from real state, retrain, repeat
+        MAX_ITERATIONS = 5
         total_actions = 0
+        all_solve_time = 0.0
 
-        for act_int in solution:
-            action = ACTION_MAP.get(act_int, GameAction.ACTION1)
-            grid, state, score, obs = env.step(action)
-            total_actions += 1
+        for iteration in range(MAX_ITERATIONS):
+            print(f"\n  === Phase 3: SOLVE iteration {iteration+1}/{MAX_ITERATIONS} ({game_id}) ===")
+            t3 = time.time()
 
-            if state == "WIN":
+            # Determine start grid for A*
+            if iteration == 0:
+                search_start = exploration["initial_grid"]
+            else:
+                search_start = current_real_grid
+
+            solution = astar_solve(
+                self.world_model, self.world_params,
+                self.role_model, self.role_params,
+                search_start, exploration["move_counts"],
+                available, movable_colors,
+                max_states=500000, max_depth=80,
+            )
+
+            if solution is None:
+                print("  [solve] A* failed — escalating to LLM...")
+                solution = escalate_to_llm(exploration, perception)
+
+            solve_time = time.time() - t3
+            all_solve_time += solve_time
+
+            if solution is None:
                 total_time = time.time() - t0
-                level = getattr(obs, 'levels_completed', 1)
-                print(f"  *** WIN on {game_id} level {level} "
-                      f"after {total_actions} actions in {total_time:.1f}s! ***")
-                return {"won": True, "actions": total_actions,
-                        "game_id": game_id, "level": level,
-                        "phase": "execute_win",
-                        "solution_length": len(solution),
-                        "explore_time": explore_time,
-                        "perceive_time": perceive_time,
-                        "solve_time": solve_time,
-                        "total_time": total_time}
+                return {"won": False, "actions": total_actions + len(transitions),
+                        "game_id": game_id, "phase": "solve_failed",
+                        "iteration": iteration + 1,
+                        "explore_time": explore_time, "perceive_time": perceive_time,
+                        "solve_time": all_solve_time, "total_time": total_time,
+                        "n_movable": perception["n_movable"],
+                        "n_targets": perception["n_targets"]}
 
-            if state == "GAME_OVER":
-                break
+            # ── EXECUTE with divergence detection ──
+            print(f"\n  === EXECUTE iter {iteration+1}: {len(solution)} actions ===")
+
+            if iteration == 0:
+                env = ArcEnv(game_id, offline=False)
+                grid, state, score, obs = env.reset()
+            # else: env continues from where we left off
+
+            diverged = False
+            new_transitions = []
+            iter_actions = 0
+
+            for step_i, act_int in enumerate(solution):
+                action = ACTION_MAP.get(act_int, GameAction.ACTION1)
+                grid_before = grid.copy()
+
+                # Predict what the model expects
+                grid_oh = grid_to_onehot(grid)
+                act_arr = jnp.array([act_int], dtype=jnp.int32)
+                predicted = np.array(jnp.argmax(
+                    self.world_model.apply(self.world_params, grid_oh, act_arr),
+                    axis=1
+                )[0])
+
+                # Execute on real env
+                grid, state, score, obs = env.step(action)
+                total_actions += 1
+                iter_actions += 1
+
+                # Record transition for retraining
+                new_transitions.append({
+                    "grid_before": grid_before,
+                    "action": act_int,
+                    "grid_after": grid.copy(),
+                })
+
+                if state == "WIN":
+                    total_time = time.time() - t0
+                    level = getattr(obs, 'levels_completed', 1)
+                    print(f"\n  *** WIN on {game_id} level {level} "
+                          f"after {total_actions} total actions "
+                          f"({iteration+1} iterations, {total_time:.1f}s)! ***")
+                    return {"won": True, "actions": total_actions,
+                            "game_id": game_id, "level": level,
+                            "phase": "execute_win",
+                            "iteration": iteration + 1,
+                            "solution_length": len(solution),
+                            "explore_time": explore_time,
+                            "perceive_time": perceive_time,
+                            "solve_time": all_solve_time,
+                            "total_time": total_time}
+
+                if state == "GAME_OVER":
+                    print(f"  [execute] GAME_OVER at step {step_i+1}")
+                    total_time = time.time() - t0
+                    return {"won": False, "actions": total_actions,
+                            "game_id": game_id, "phase": "game_over",
+                            "iteration": iteration + 1,
+                            "total_time": total_time}
+
+                # Check for divergence: model prediction vs reality
+                accuracy = np.mean(predicted == grid)
+                if accuracy < 0.95:
+                    print(f"  [execute] DIVERGED at step {step_i+1}: "
+                          f"model accuracy={accuracy:.1%} — re-exploring from real state")
+                    diverged = True
+                    current_real_grid = grid.copy()
+                    break
+
+            if not diverged:
+                # Plan executed fully without divergence but didn't win
+                print(f"  [execute] Plan completed ({iter_actions} actions), no win, no divergence")
+                current_real_grid = grid.copy()
+
+            # ── RETRAIN with new transitions from real execution ──
+            if new_transitions:
+                print(f"  [retrain] Adding {len(new_transitions)} real transitions, retraining...")
+                all_transitions = []
+                for exp in self.all_explorations:
+                    all_transitions.extend(exp["transitions"])
+                all_transitions.extend(new_transitions)
+                self.world_model, self.world_params = self._train_world_model(
+                    all_transitions, num_epochs=30
+                )
 
         total_time = time.time() - t0
         return {"won": False, "actions": total_actions + len(transitions),
-                "game_id": game_id, "phase": "execute_failed",
-                "solution_length": len(solution),
+                "game_id": game_id, "phase": "max_iterations",
+                "iterations": MAX_ITERATIONS,
                 "explore_time": explore_time, "perceive_time": perceive_time,
-                "solve_time": solve_time, "total_time": total_time}
+                "solve_time": all_solve_time, "total_time": total_time}
 
     def _train_world_model(self, transitions, num_epochs=50):
         n = len(transitions)
