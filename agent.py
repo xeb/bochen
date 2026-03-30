@@ -42,8 +42,29 @@ ACTION_MAP = {
 # MODELS (all JAX/Flax)
 # ============================================================================
 
+class ResBlock(nn.Module):
+    """Residual block: Conv → LayerNorm → ReLU → Conv + skip."""
+    features: int
+
+    @nn.compact
+    def __call__(self, x, train: bool = True):
+        residual = x
+        y = nn.Conv(features=self.features, kernel_size=(3, 3), padding='SAME')(x)
+        y = nn.LayerNorm()(y)
+        y = nn.relu(y)
+        y = nn.Conv(features=self.features, kernel_size=(3, 3), padding='SAME')(y)
+        y = nn.LayerNorm()(y)
+        if residual.shape[-1] != self.features:
+            residual = nn.Conv(features=self.features, kernel_size=(1, 1))(residual)
+        return nn.relu(y + residual)
+
+
 class GridWorldModel(nn.Module):
-    """Predicts next grid from (current_grid, action). Deterministic dynamics."""
+    """Predicts next grid from (current_grid, action).
+
+    ResNet with skip connections + dilated convs for receptive field.
+    Moderate capacity to prevent overfitting on small training sets.
+    """
     num_actions: int = 8
 
     @nn.compact
@@ -54,31 +75,44 @@ class GridWorldModel(nn.Module):
             (grid_onehot.shape[0], 16, grid_onehot.shape[2], grid_onehot.shape[3])
         )
         x = jnp.concatenate([grid_onehot, act_map], axis=1)
-        x = jnp.transpose(x, (0, 2, 3, 1))  # NCHW -> NHWC
-        x = nn.Conv(features=64, kernel_size=(3, 3), padding='SAME')(x)
-        x = nn.relu(x)
-        x = nn.Conv(features=64, kernel_size=(3, 3), padding='SAME')(x)
-        x = nn.relu(x)
-        x = nn.Conv(features=32, kernel_size=(3, 3), padding='SAME')(x)
-        x = nn.relu(x)
+        x = jnp.transpose(x, (0, 2, 3, 1))  # NHWC
+
+        # Stem
+        stem = nn.Conv(features=48, kernel_size=(3, 3), padding='SAME')(x)
+        stem = nn.relu(stem)
+
+        # 2 residual blocks
+        x = ResBlock(features=48)(stem)
+        x = ResBlock(features=48)(x)
+
+        # Dilated convs for wider receptive field (sees 13x13+ area)
+        d = nn.Conv(features=48, kernel_size=(3, 3), padding='SAME',
+                    kernel_dilation=(2, 2))(x)
+        d = nn.relu(d)
+        d = nn.Conv(features=48, kernel_size=(3, 3), padding='SAME',
+                    kernel_dilation=(4, 4))(d)
+        x = nn.relu(x + d)
+
+        # 1 more res block
+        x = ResBlock(features=48)(x)
+
+        # Skip from stem
+        x = x + stem
+
+        # Per-cell prediction
         x = nn.Conv(features=16, kernel_size=(1, 1))(x)
-        x = jnp.transpose(x, (0, 3, 1, 2))  # NHWC -> NCHW
+        x = jnp.transpose(x, (0, 3, 1, 2))  # NCHW
         return x
 
 
 class CellRoleCNN(nn.Module):
-    """Classifies each cell into a role: 0=background, 1=wall, 2=movable, 3=target.
-
-    Input:  (B, C, H, W) where C = 16 (one-hot color) + 4 (movement stats)
-    Output: (B, 4, H, W) per-cell role logits
-    """
+    """Classifies each cell into a role: 0=background, 1=wall, 2=movable, 3=target."""
     @nn.compact
     def __call__(self, x):
         x = jnp.transpose(x, (0, 2, 3, 1))  # NHWC
         x = nn.Conv(features=32, kernel_size=(3, 3), padding='SAME')(x)
-        x = nn.relu(x)
-        x = nn.Conv(features=32, kernel_size=(3, 3), padding='SAME')(x)
-        x = nn.relu(x)
+        x = ResBlock(features=32)(x)
+        x = ResBlock(features=32)(x)
         x = nn.Conv(features=4, kernel_size=(1, 1))(x)
         x = jnp.transpose(x, (0, 3, 1, 2))  # NCHW
         return x
@@ -106,7 +140,7 @@ def get_available_ints(env: ArcEnv) -> list[int]:
 # PHASE 1: EXPLORE
 # ============================================================================
 
-def explore(game_id: str, budget: int = 120) -> dict:
+def explore(game_id: str, budget: int = 400) -> dict:
     """Systematically explore a game. Returns exploration results."""
     env = ArcEnv(game_id, offline=False)
     grid0, state, score, obs = env.reset()
@@ -162,14 +196,14 @@ def explore(game_id: str, budget: int = 120) -> dict:
             _, st = record(env, b)
 
     # --- Strategy 3: Push objects maximally in each direction to reveal targets ---
-    # Do each action 8 times to push objects far from start
+    # Do each action 12 times to push objects far from start
     pushed_grids = []
     for act in available:
-        if actions_used >= budget - 8:
+        if actions_used >= budget - 12:
             break
         env = ArcEnv(game_id, offline=False)
         env.reset()
-        for _ in range(8):
+        for _ in range(12):
             if actions_used >= budget:
                 break
             _, st = record(env, act)
@@ -177,16 +211,19 @@ def explore(game_id: str, budget: int = 120) -> dict:
                 break
         pushed_grids.append(env._extract()[0].copy())
 
-    # --- Strategy 4: Random play to fill remaining budget ---
-    if actions_used < budget:
+    # --- Strategy 4: Long random walks to cover diverse state space ---
+    # Multiple episodes of 30+ steps each to reach states far from initial
+    while actions_used < budget:
         env = ArcEnv(game_id, offline=False)
         env.reset()
-        while actions_used < budget:
+        walk_length = min(40, budget - actions_used)
+        for _ in range(walk_length):
+            if actions_used >= budget:
+                break
             act = random.choice(available)
             _, st = record(env, act)
             if st in ("WIN", "GAME_OVER"):
-                env = ArcEnv(game_id, offline=False)
-                env.reset()
+                break
 
     print(f"  [explore] {game_id}: {len(transitions)} transitions, "
           f"{len(available)} actions, grid={h}x{w}")
@@ -728,7 +765,7 @@ class ThreePhaseAgent:
 
         # ── Phase 1: EXPLORE ──
         print(f"\n  === Phase 1: EXPLORE ({game_id}) ===")
-        exploration = explore(game_id, budget=120)
+        exploration = explore(game_id, budget=400)
         self.all_explorations.append(exploration)
         transitions = exploration["transitions"]
         available = exploration["available_actions"]
@@ -761,77 +798,61 @@ class ThreePhaseAgent:
         print(f"  [perceive] Done in {perceive_time:.1f}s: "
               f"{perception['n_movable']} movable, {perception['n_targets']} targets")
 
-        # ── Phase 3: ITERATIVE SOLVE ──
-        # Execute A* plan, detect divergence, re-explore from real state, retrain, repeat
-        MAX_ITERATIONS = 5
+        # ── Phase 3: MPC SOLVE ──
+        # Model Predictive Control: plan short horizon, execute, replan from real state
+        MPC_HORIZON = 8          # plan 8 steps ahead
+        MPC_MAX_ROUNDS = 30      # max replanning rounds (8*30=240 total actions)
+        MPC_SEARCH_BUDGET = 50000  # states per A* call (smaller = faster replan)
+
         total_actions = 0
         all_solve_time = 0.0
+        new_transitions = []
 
-        for iteration in range(MAX_ITERATIONS):
-            print(f"\n  === Phase 3: SOLVE iteration {iteration+1}/{MAX_ITERATIONS} ({game_id}) ===")
+        env = ArcEnv(game_id, offline=False)
+        grid, state, score, obs = env.reset()
+        initial_h = manhattan_heuristic(grid, movable_colors,
+                                         np.array(perception["targets"]))
+        best_h_seen = initial_h
+
+        print(f"\n  === Phase 3: MPC SOLVE ({game_id}) ===")
+        print(f"  [mpc] horizon={MPC_HORIZON}, max_rounds={MPC_MAX_ROUNDS}, "
+              f"initial_h={initial_h:.0f}")
+
+        for round_i in range(MPC_MAX_ROUNDS):
             t3 = time.time()
 
-            # Determine start grid for A*
-            if iteration == 0:
-                search_start = exploration["initial_grid"]
-            else:
-                search_start = current_real_grid
-
-            solution = astar_solve(
+            # Plan short horizon from CURRENT REAL state
+            plan = astar_solve(
                 self.world_model, self.world_params,
                 self.role_model, self.role_params,
-                search_start, exploration["move_counts"],
+                grid, exploration["move_counts"],
                 available, movable_colors,
-                max_states=500000, max_depth=80,
+                max_states=MPC_SEARCH_BUDGET, max_depth=MPC_HORIZON,
             )
 
-            if solution is None:
-                print("  [solve] A* failed — escalating to LLM...")
-                solution = escalate_to_llm(exploration, perception)
+            # Fallback: greedy if A* returns None
+            if plan is None:
+                plan = _greedy_best_path(
+                    self.world_model, self.world_params, grid,
+                    available, movable_colors,
+                    np.array(perception["targets"]),
+                    max_depth=MPC_HORIZON,
+                )
 
             solve_time = time.time() - t3
             all_solve_time += solve_time
 
-            if solution is None:
-                total_time = time.time() - t0
-                return {"won": False, "actions": total_actions + len(transitions),
-                        "game_id": game_id, "phase": "solve_failed",
-                        "iteration": iteration + 1,
-                        "explore_time": explore_time, "perceive_time": perceive_time,
-                        "solve_time": all_solve_time, "total_time": total_time,
-                        "n_movable": perception["n_movable"],
-                        "n_targets": perception["n_targets"]}
+            if not plan:
+                print(f"  [mpc] Round {round_i+1}: no plan found")
+                continue
 
-            # ── EXECUTE with divergence detection ──
-            print(f"\n  === EXECUTE iter {iteration+1}: {len(solution)} actions ===")
-
-            if iteration == 0:
-                env = ArcEnv(game_id, offline=False)
-                grid, state, score, obs = env.reset()
-            # else: env continues from where we left off
-
-            diverged = False
-            new_transitions = []
-            iter_actions = 0
-
-            for step_i, act_int in enumerate(solution):
+            # Execute the short plan on the REAL environment
+            for act_int in plan:
                 action = ACTION_MAP.get(act_int, GameAction.ACTION1)
                 grid_before = grid.copy()
-
-                # Predict what the model expects
-                grid_oh = grid_to_onehot(grid)
-                act_arr = jnp.array([act_int], dtype=jnp.int32)
-                predicted = np.array(jnp.argmax(
-                    self.world_model.apply(self.world_params, grid_oh, act_arr),
-                    axis=1
-                )[0])
-
-                # Execute on real env
                 grid, state, score, obs = env.step(action)
                 total_actions += 1
-                iter_actions += 1
 
-                # Record transition for retraining
                 new_transitions.append({
                     "grid_before": grid_before,
                     "action": act_int,
@@ -842,69 +863,102 @@ class ThreePhaseAgent:
                     total_time = time.time() - t0
                     level = getattr(obs, 'levels_completed', 1)
                     print(f"\n  *** WIN on {game_id} level {level} "
-                          f"after {total_actions} total actions "
-                          f"({iteration+1} iterations, {total_time:.1f}s)! ***")
+                          f"after {total_actions} actions "
+                          f"({round_i+1} MPC rounds, {total_time:.1f}s)! ***")
                     return {"won": True, "actions": total_actions,
                             "game_id": game_id, "level": level,
-                            "phase": "execute_win",
-                            "iteration": iteration + 1,
-                            "solution_length": len(solution),
+                            "phase": "mpc_win",
+                            "mpc_rounds": round_i + 1,
                             "explore_time": explore_time,
                             "perceive_time": perceive_time,
                             "solve_time": all_solve_time,
                             "total_time": total_time}
 
                 if state == "GAME_OVER":
-                    print(f"  [execute] GAME_OVER at step {step_i+1}")
                     total_time = time.time() - t0
+                    print(f"  [mpc] GAME_OVER at round {round_i+1}")
                     return {"won": False, "actions": total_actions,
                             "game_id": game_id, "phase": "game_over",
-                            "iteration": iteration + 1,
                             "total_time": total_time}
 
-                # Check for divergence: model prediction vs reality
-                accuracy = np.mean(predicted == grid)
-                if accuracy < 0.95:
-                    print(f"  [execute] DIVERGED at step {step_i+1}: "
-                          f"model accuracy={accuracy:.1%} — re-exploring from real state")
-                    diverged = True
-                    current_real_grid = grid.copy()
-                    break
+            # Check progress
+            current_h = manhattan_heuristic(grid, movable_colors,
+                                            np.array(perception["targets"]))
+            improved = current_h < best_h_seen
+            if improved:
+                best_h_seen = current_h
 
-            if not diverged:
-                # Plan executed fully without divergence but didn't win
-                print(f"  [execute] Plan completed ({iter_actions} actions), no win, no divergence")
-                current_real_grid = grid.copy()
+            if (round_i + 1) % 3 == 0 or improved:
+                print(f"  [mpc] Round {round_i+1}: h={current_h:.0f} "
+                      f"(best={best_h_seen:.0f}) actions={total_actions}")
 
-            # ── RETRAIN with new transitions from real execution ──
-            if new_transitions:
-                print(f"  [retrain] Adding {len(new_transitions)} real transitions, retraining...")
-                all_transitions = []
+            # Fine-tune model periodically with accumulated real transitions
+            if (round_i + 1) % 5 == 0 and new_transitions:
+                print(f"  [mpc] Fine-tuning with {len(new_transitions)} new transitions...")
+                all_trans = []
                 for exp in self.all_explorations:
-                    all_transitions.extend(exp["transitions"])
-                all_transitions.extend(new_transitions)
+                    all_trans.extend(exp["transitions"])
+                all_trans.extend(new_transitions)
                 self.world_model, self.world_params = self._train_world_model(
-                    all_transitions, num_epochs=30
+                    all_trans, num_epochs=30, finetune=True
                 )
+
+        # If we get here, MPC exhausted all rounds
+        # Try LLM escalation as last resort
+        print(f"  [mpc] Exhausted {MPC_MAX_ROUNDS} rounds, escalating to LLM...")
+        llm_plan = escalate_to_llm(exploration, perception)
+        if llm_plan:
+            for act_int in llm_plan:
+                action = ACTION_MAP.get(act_int, GameAction.ACTION1)
+                grid, state, score, obs = env.step(action)
+                total_actions += 1
+                if state == "WIN":
+                    total_time = time.time() - t0
+                    level = getattr(obs, 'levels_completed', 1)
+                    return {"won": True, "actions": total_actions,
+                            "game_id": game_id, "level": level,
+                            "phase": "llm_win", "total_time": total_time}
 
         total_time = time.time() - t0
         return {"won": False, "actions": total_actions + len(transitions),
-                "game_id": game_id, "phase": "max_iterations",
-                "iterations": MAX_ITERATIONS,
+                "game_id": game_id, "phase": "mpc_exhausted",
+                "mpc_rounds": MPC_MAX_ROUNDS,
+                "best_h": best_h_seen,
                 "explore_time": explore_time, "perceive_time": perceive_time,
                 "solve_time": all_solve_time, "total_time": total_time}
 
-    def _train_world_model(self, transitions, num_epochs=50):
+    def _train_world_model(self, transitions, num_epochs=80, finetune=False):
         n = len(transitions)
         grids_before = np.stack([t["grid_before"] for t in transitions])
         actions = np.array([t["action"] for t in transitions], dtype=np.int32)
         grids_after = np.stack([t["grid_after"] for t in transitions])
 
+        # Hold out 15% for validation (generalization check)
+        perm = np.random.permutation(n)
+        val_n = max(1, n // 7)
+        val_idx, train_idx = perm[:val_n], perm[val_n:]
+        print(f"  [world model] {len(train_idx)} train, {val_n} val "
+              f"({'finetune' if finetune else 'fresh'})")
+
         model = GridWorldModel()
-        rng = jax.random.key(42)
         h, w = grids_before.shape[1], grids_before.shape[2]
-        params = model.init(rng, jnp.zeros((1, 16, h, w)), jnp.zeros((1,), dtype=jnp.int32))
-        tx = optax.adam(1e-3)
+
+        if finetune and self.world_model is not None and self.world_params is not None:
+            # Fine-tune from existing params — don't reinitialize!
+            params = self.world_params
+            lr = 3e-4  # lower LR for fine-tuning
+        else:
+            rng = jax.random.key(42)
+            params = model.init(rng, jnp.zeros((1, 16, h, w)), jnp.zeros((1,), dtype=jnp.int32))
+            lr = 1e-3
+
+        total_steps = num_epochs * max(1, len(train_idx) // 64)
+        schedule = optax.warmup_cosine_decay_schedule(
+            init_value=lr * 0.1, peak_value=lr,
+            warmup_steps=min(50, total_steps // 5),
+            decay_steps=total_steps, end_value=lr * 0.01,
+        )
+        tx = optax.adamw(schedule, weight_decay=1e-4)
         opt_state = tx.init(params)
 
         @jax.jit
@@ -919,12 +973,17 @@ class ThreePhaseAgent:
             updates, new_opt = tx.update(grads, opt_state, params)
             return optax.apply_updates(params, updates), new_opt, loss
 
-        bs = min(64, n)
+        bs = min(64, len(train_idx))
+        best_val_acc = 0.0
+        best_params = params
+        patience = 0
+        max_patience = 15
+
         for epoch in range(num_epochs):
-            perm = np.random.permutation(n)
+            epoch_perm = np.random.permutation(len(train_idx))
             eloss, nb = 0.0, 0
-            for i in range(0, n, bs):
-                idx = perm[i:i + bs]
+            for i in range(0, len(train_idx), bs):
+                idx = train_idx[epoch_perm[i:i + bs]]
                 params, opt_state, loss = train_step(
                     params, opt_state,
                     jnp.array(grids_before[idx]),
@@ -933,14 +992,39 @@ class ThreePhaseAgent:
                 )
                 eloss += float(loss)
                 nb += 1
-            if (epoch + 1) % 25 == 0 or epoch == 0:
-                print(f"  [world model] Epoch {epoch+1}/{num_epochs}: loss={eloss/nb:.4f}")
 
-        boh = jax.nn.one_hot(jnp.array(grids_before), 16)
-        boh = jnp.transpose(boh, (0, 3, 1, 2))
-        pred = jnp.argmax(model.apply(params, boh, jnp.array(actions)), axis=1)
-        acc = float(jnp.mean(pred == jnp.array(grids_after)))
-        print(f"  [world model] Accuracy: {acc*100:.1f}%")
+            # Validation accuracy
+            val_boh = jax.nn.one_hot(jnp.array(grids_before[val_idx]), 16)
+            val_boh = jnp.transpose(val_boh, (0, 3, 1, 2))
+            val_pred = jnp.argmax(model.apply(params, val_boh, jnp.array(actions[val_idx])), axis=1)
+            val_acc = float(jnp.mean(val_pred == jnp.array(grids_after[val_idx])))
+
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_params = jax.tree.map(lambda x: x.copy(), params)
+                patience = 0
+            else:
+                patience += 1
+
+            if (epoch + 1) % 20 == 0 or epoch == 0:
+                print(f"  [world model] Epoch {epoch+1}/{num_epochs}: "
+                      f"loss={eloss/nb:.4f} val_acc={val_acc*100:.1f}%")
+
+            if patience >= max_patience and epoch > 30:
+                print(f"  [world model] Early stop at epoch {epoch+1} "
+                      f"(val_acc={best_val_acc*100:.1f}%)")
+                break
+
+        # Use best params (highest validation accuracy)
+        params = best_params
+
+        # Final accuracy on ALL data
+        all_boh = jax.nn.one_hot(jnp.array(grids_before), 16)
+        all_boh = jnp.transpose(all_boh, (0, 3, 1, 2))
+        pred = jnp.argmax(model.apply(params, all_boh, jnp.array(actions)), axis=1)
+        train_acc = float(jnp.mean(pred == jnp.array(grids_after)))
+        print(f"  [world model] Final: train_acc={train_acc*100:.1f}% "
+              f"val_acc={best_val_acc*100:.1f}% on {n} transitions")
         return model, params
 
 
