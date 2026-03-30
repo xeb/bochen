@@ -23,7 +23,7 @@ from notify import check_and_notify, notify_experiment_killed
 
 # Default config
 DEFAULT_GAMES = ["ls20", "ft09", "vc33"]
-DEFAULT_EXPERIMENTS = ["imagine", "exp2_worldmodel", "exp3_probe_solve"]
+DEFAULT_EXPERIMENTS = ["three_phase", "imagine", "exp2_worldmodel", "exp3_probe_solve"]
 
 EXPERIMENT_TIMEOUTS = {
     "imagine": 300,          # probe+train+search+execute
@@ -39,7 +39,10 @@ _agents = {}
 
 def get_agent(experiment: str):
     if experiment not in _agents:
-        if experiment == "imagine":
+        if experiment == "three_phase":
+            from agent import ThreePhaseAgent
+            _agents[experiment] = ThreePhaseAgent()
+        elif experiment == "imagine":
             from imagine_agent import ImagineAgent
             _agents[experiment] = ImagineAgent()
         elif experiment == "exp2_worldmodel":
