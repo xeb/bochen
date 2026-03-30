@@ -140,7 +140,7 @@ def get_available_ints(env: ArcEnv) -> list[int]:
 # PHASE 1: EXPLORE
 # ============================================================================
 
-def explore(game_id: str, budget: int = 400) -> dict:
+def explore(game_id: str, budget: int = 600) -> dict:
     """Systematically explore a game. Returns exploration results."""
     env = ArcEnv(game_id, offline=False)
     grid0, state, score, obs = env.reset()
@@ -211,12 +211,36 @@ def explore(game_id: str, budget: int = 400) -> dict:
                 break
         pushed_grids.append(env._extract()[0].copy())
 
-    # --- Strategy 4: Long random walks to cover diverse state space ---
-    # Multiple episodes of 30+ steps each to reach states far from initial
+    # --- Strategy 4: Targeted deep exploration ---
+    # Do systematic walks: push in one direction N times, then explore from THAT state
+    # This covers mid-game and late-game states the model will need during solving
+    for primary_dir in available:
+        if actions_used >= budget - 30:
+            break
+        env = ArcEnv(game_id, offline=False)
+        env.reset()
+        # Push N times in primary direction to reach mid-game state
+        for _ in range(15):
+            if actions_used >= budget:
+                break
+            _, st = record(env, primary_dir)
+            if st in ("WIN", "GAME_OVER"):
+                break
+        # Now explore from this mid-game state with mixed actions
+        if st not in ("WIN", "GAME_OVER"):
+            for _ in range(10):
+                if actions_used >= budget:
+                    break
+                act = random.choice(available)
+                _, st = record(env, act)
+                if st in ("WIN", "GAME_OVER"):
+                    break
+
+    # Fill remaining with long random walks
     while actions_used < budget:
         env = ArcEnv(game_id, offline=False)
         env.reset()
-        walk_length = min(40, budget - actions_used)
+        walk_length = min(30, budget - actions_used)
         for _ in range(walk_length):
             if actions_used >= budget:
                 break
@@ -765,7 +789,7 @@ class ThreePhaseAgent:
 
         # ── Phase 1: EXPLORE ──
         print(f"\n  === Phase 1: EXPLORE ({game_id}) ===")
-        exploration = explore(game_id, budget=400)
+        exploration = explore(game_id, budget=600)
         self.all_explorations.append(exploration)
         transitions = exploration["transitions"]
         available = exploration["available_actions"]
@@ -800,9 +824,9 @@ class ThreePhaseAgent:
 
         # ── Phase 3: MPC SOLVE ──
         # Model Predictive Control: plan short horizon, execute, replan from real state
-        MPC_HORIZON = 8          # plan 8 steps ahead
-        MPC_MAX_ROUNDS = 30      # max replanning rounds (8*30=240 total actions)
-        MPC_SEARCH_BUDGET = 50000  # states per A* call (smaller = faster replan)
+        MPC_HORIZON = 6          # plan 6 steps ahead
+        MPC_MAX_ROUNDS = 40      # max replanning rounds
+        MPC_SEARCH_BUDGET = 30000  # states per A* call
 
         total_actions = 0
         all_solve_time = 0.0
@@ -817,6 +841,10 @@ class ThreePhaseAgent:
         print(f"\n  === Phase 3: MPC SOLVE ({game_id}) ===")
         print(f"  [mpc] horizon={MPC_HORIZON}, max_rounds={MPC_MAX_ROUNDS}, "
               f"initial_h={initial_h:.0f}")
+
+        target_arr = np.array(perception["targets"])
+        prev_params = None  # for rollback after bad fine-tune
+        stagnant_rounds = 0
 
         for round_i in range(MPC_MAX_ROUNDS):
             t3 = time.time()
@@ -834,8 +862,7 @@ class ThreePhaseAgent:
             if plan is None:
                 plan = _greedy_best_path(
                     self.world_model, self.world_params, grid,
-                    available, movable_colors,
-                    np.array(perception["targets"]),
+                    available, movable_colors, target_arr,
                     max_depth=MPC_HORIZON,
                 )
 
@@ -844,10 +871,32 @@ class ThreePhaseAgent:
 
             if not plan:
                 print(f"  [mpc] Round {round_i+1}: no plan found")
+                stagnant_rounds += 1
+                if stagnant_rounds > 5:
+                    break
                 continue
 
-            # Execute the short plan on the REAL environment
-            for act_int in plan:
+            # ── Execute with per-step validation ──
+            h_before_plan = manhattan_heuristic(grid, movable_colors, target_arr)
+            plan_aborted = False
+
+            for step_i, act_int in enumerate(plan):
+                # Predict what model expects BEFORE executing
+                grid_oh = grid_to_onehot(grid)
+                act_arr = jnp.array([act_int], dtype=jnp.int32)
+                predicted = np.array(jnp.argmax(
+                    self.world_model.apply(self.world_params, grid_oh, act_arr),
+                    axis=1)[0])
+
+                # Sanity check: does the prediction have reasonable colors?
+                pred_h = manhattan_heuristic(predicted, movable_colors, target_arr)
+                if pred_h > best_h_seen * 3 and pred_h > h_before_plan * 3:
+                    print(f"  [mpc] Bad prediction at step {step_i+1}: "
+                          f"pred_h={pred_h:.0f} >> best={best_h_seen:.0f}, skipping action")
+                    plan_aborted = True
+                    break
+
+                # Execute
                 action = ACTION_MAP.get(act_int, GameAction.ACTION1)
                 grid_before = grid.copy()
                 grid, state, score, obs = env.step(action)
@@ -876,32 +925,32 @@ class ThreePhaseAgent:
 
                 if state == "GAME_OVER":
                     total_time = time.time() - t0
-                    print(f"  [mpc] GAME_OVER at round {round_i+1}")
+                    print(f"  [mpc] GAME_OVER at round {round_i+1}, "
+                          f"action {total_actions}")
                     return {"won": False, "actions": total_actions,
                             "game_id": game_id, "phase": "game_over",
-                            "total_time": total_time}
+                            "best_h": best_h_seen, "total_time": total_time}
 
-            # Check progress
-            current_h = manhattan_heuristic(grid, movable_colors,
-                                            np.array(perception["targets"]))
+            # Check progress after plan
+            current_h = manhattan_heuristic(grid, movable_colors, target_arr)
             improved = current_h < best_h_seen
             if improved:
                 best_h_seen = current_h
+                stagnant_rounds = 0
+            else:
+                stagnant_rounds += 1
 
-            if (round_i + 1) % 3 == 0 or improved:
+            if (round_i + 1) % 2 == 0 or improved or plan_aborted:
                 print(f"  [mpc] Round {round_i+1}: h={current_h:.0f} "
-                      f"(best={best_h_seen:.0f}) actions={total_actions}")
+                      f"(best={best_h_seen:.0f}) actions={total_actions}"
+                      f"{' ABORTED' if plan_aborted else ''}")
 
-            # Fine-tune model periodically with accumulated real transitions
-            if (round_i + 1) % 5 == 0 and new_transitions:
-                print(f"  [mpc] Fine-tuning with {len(new_transitions)} new transitions...")
-                all_trans = []
-                for exp in self.all_explorations:
-                    all_trans.extend(exp["transitions"])
-                all_trans.extend(new_transitions)
-                self.world_model, self.world_params = self._train_world_model(
-                    all_trans, num_epochs=30, finetune=True
-                )
+            # No fine-tuning during MPC — the initial model generalizes
+            # better than a fine-tuned one that overfits to recent states
+
+            if stagnant_rounds > 12:
+                print(f"  [mpc] Stagnant for {stagnant_rounds} rounds, stopping")
+                break
 
         # If we get here, MPC exhausted all rounds
         # Try LLM escalation as last resort
